@@ -1,14 +1,32 @@
 import json
 import logging
+from pprint import pformat
 import sys
 import requests
 from config import config
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.serialization import StringSerializer
+from confluent_kafka.schema_registry.avro import AvroSerializer
+from confluent_kafka import SerializingProducer
 
 def fetch_playlist_items_page(google_api_key, playlist_id, page_token=None):
     response = requests.get("https://www.googleapis.com/youtube/v3/playlistItems", params={
         "key": google_api_key, 
         "playlistId": playlist_id, 
         "part": "contentDetails", 
+        "pageToken": page_token, 
+
+        })
+
+    payload = json.loads(response.text)
+    logging.debug("GOT %s", payload)
+    return payload
+
+def fetch_videos_page(google_api_key, video_id, page_token=None):
+    response = requests.get("https://www.googleapis.com/youtube/v3/videos", params={
+        "key": google_api_key, 
+        "id": video_id, 
+        "part": "snippet,statistics", 
         "pageToken": page_token, 
 
         })
@@ -27,8 +45,39 @@ def fetch_playlist_items(google_api_key, playlist_id, page_token=None):
     if next_page_token is not None:
         yield from fetch_playlist_items(google_api_key, playlist_id, next_page_token)
 
+def fetch_videos(google_api_key, video_id, page_token=None):
+    payload = fetch_videos_page(google_api_key, video_id, page_token)
+
+    yield from payload["items"]
+
+    next_page_token = payload.get("nextPageToken")
+
+    if next_page_token is not None:
+        yield from fetch_videos(google_api_key, video_id, next_page_token)
+
+def summarize_video(video):
+    return {
+        "video_id": video["id"],
+        "title": video["snippet"]["title"],
+        "views": video['statistics'].get('viewCount', 0),
+        "likes": video['statistics'].get('likeCount', 0),
+        "comments": video['statistics'].get('commentCount', 0)
+    }
+
+def on_delivery(err, record):
+    pass
+
 def main():
     logging.info("START")
+
+    schema_registry_client = SchemaRegistryClient(config["schema_registry"])
+    youtube_videos_value_schema = schema_registry_client.get_latest_version("youtube_videos-value")
+
+    kafka_config = config["kafka"] | {
+        "key.serializer": StringSerializer(),
+        "value.serializer": AvroSerializer(schema_registry_client, youtube_videos_value_schema.schema.schema_str),
+    }
+    producer = SerializingProducer(kafka_config)
 
     ### Make sure to have a config.py file in root with a dictionary that contains your api key and the playlist you want
     google_api_key = config["google_api_key"]
@@ -36,7 +85,23 @@ def main():
 
     video_items = fetch_playlist_items(google_api_key, playlist_id)
     for item in video_items:
-        logging.info("GOT %s", item)
+        video_id = item['contentDetails']['videoId']
+        for video in fetch_videos(google_api_key, video_id):
+            logging.info("GOT %s", pformat(summarize_video(video)))
+
+            producer.produce(
+                topic = 'youtube_videos',
+                key = video_id,
+                value = {
+                    "TITLE": video["snippet"]["title"],
+                    "VIEWS": int(video['statistics']['viewCount']),
+                    "LIKES": int(video['statistics']['likeCount']),
+                    "COMMENTS": int(video['statistics']['commentCount'])
+                },
+                on_delivery = on_delivery
+            )
+    
+    producer.flush()
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
